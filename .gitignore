@@ -4,6 +4,9 @@ __pycache__/
 venv/
 data/raw/
 data/processed/*.csv
+!data/processed/person_b_input.csv
+!data/processed/structural_features.csv
+!data/processed/structural_features_report.csv
 *.pt
 *.ckpt
 .ipynb_checkpoints/
