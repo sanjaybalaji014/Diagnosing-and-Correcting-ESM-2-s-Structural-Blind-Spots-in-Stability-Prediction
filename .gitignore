@@ -8,3 +8,5 @@ data/processed/*.csv
 *.ckpt
 .ipynb_checkpoints/
 .env
+structures/
+!data/processed/structural_features.csv
