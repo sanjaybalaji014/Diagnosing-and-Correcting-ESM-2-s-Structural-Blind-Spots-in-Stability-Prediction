@@ -11,3 +11,7 @@ data/processed/*.csv
 *.ckpt
 .ipynb_checkpoints/
 .env
+!data/processed/esm2_errors.csv
+!data/processed/utilization_analysis.csv
+!data/processed/layerwise_probe_performance.csv
+*.npz

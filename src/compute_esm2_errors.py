@@ -62,7 +62,12 @@ def main():
     print(f"Flagged {df['is_large_error'].sum()} / {len(df)} mutations as large-error "
           f"({df['is_large_error'].mean() * 100:.1f}%)")
 
-    df.to_csv(OUTPUT_CSV, index=False)
+    KEEP_COLS = [
+        "protein_id", "position", "wt_aa_x", "mut_aa", "ddG", "esm2_score_masked",
+        "rsa", "secondary_structure", "contact_density", "dist_to_core",
+        "predicted_ddg", "error", "abs_error", "is_large_error",
+    ]
+    df[KEEP_COLS].to_csv(OUTPUT_CSV, index=False)    
     print(f"\nWrote {OUTPUT_CSV}")
 
 
