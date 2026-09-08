@@ -15,3 +15,5 @@ data/processed/*.csv
 !data/processed/utilization_analysis.csv
 !data/processed/layerwise_probe_performance.csv
 *.npz
+!data/processed/cluster_utilization_summary.csv
+!data/processed/headline_finding_breakdown.csv
