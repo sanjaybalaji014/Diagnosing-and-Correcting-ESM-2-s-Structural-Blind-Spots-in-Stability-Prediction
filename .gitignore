@@ -17,3 +17,8 @@ data/processed/*.csv
 *.npz
 !data/processed/cluster_utilization_summary.csv
 !data/processed/headline_finding_breakdown.csv
+!data/processed/correction_model_results.csv
+!data/processed/thermompnn_test_predictions.csv
+!data/processed/baseline_comparison_merged.csv
+!data/processed/baseline_comparison_summary.csv
+!data/processed/baseline_comparison_offsets.csv
