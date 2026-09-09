@@ -1,4 +1,4 @@
-﻿"""
+"""
 Phase 4: compare raw ESM-2, Person A's correction model, and the ThermoMPNN
 structure-aware baseline against ground-truth ddG on the same held-out test
 set mutations.
@@ -136,10 +136,9 @@ def main():
         "thermompnn": "thermompnn_ddg_pred",
     }
 
-    rows = []
-    for name, col in methods.items():
-        y_true = merged["ddG"].to_numpy()
-        y_pred = merged[col].to_numpy()
+    def score(name, df, col, note=""):
+        y_true = df["ddG"].to_numpy()
+        y_pred = df[col].to_numpy()
         valid = np.isfinite(y_true) & np.isfinite(y_pred)
         yt, yp = y_true[valid], y_pred[valid]
 
@@ -147,12 +146,27 @@ def main():
         pe_r, _ = pearsonr(yt, yp)
         mae = np.mean(np.abs(yt - yp))
 
-        rows.append({"method": name, "n": len(yt), "spearman_r": sp_r,
-                      "pearson_r": pe_r, "mae": mae})
-        print(f"\n{name} (n={len(yt)}):")
+        print(f"\n{name} (n={len(yt)}){note}:")
         print(f"  Spearman r = {sp_r:.4f}")
         print(f"  Pearson r  = {pe_r:.4f}")
         print(f"  MAE        = {mae:.4f}")
+        return {"method": name, "n": len(yt), "spearman_r": sp_r,
+                "pearson_r": pe_r, "mae": mae}
+
+    rows = []
+    for name, col in methods.items():
+        rows.append(score(name, merged, col,
+                           note=" -- ThermoMPNN-matched subset, for the three-way comparison"))
+
+    # Discrepancy-2 fix: report the correction model's standalone performance
+    # on the FULL correction_model_results.csv (all 30,886 rows), independent
+    # of whether a row happened to match a ThermoMPNN prediction. This is the
+    # number that should be cited as the correction model's own test-set
+    # performance (matches Person A's full-set figure); the
+    # "correction_model" row above exists only so all three methods are
+    # compared on identical rows.
+    rows.append(score("correction_model_full_set", corr, "corrected_prediction",
+                       note=" -- ALL correction-model rows, not matched to ThermoMPNN; cite this for standalone correction-model performance"))
 
     summary = pd.DataFrame(rows)
     summary.to_csv(SUMMARY_OUT_CSV, index=False)
