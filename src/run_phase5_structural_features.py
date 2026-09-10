@@ -26,12 +26,24 @@ Two wrinkles Phase 1 didn't have to handle, both dealt with here:
      producing garbage features.
 
 Reads:
-  data/processed/phase5_clinvar_gnomad_variants.csv  (gene, wt_aa, position,
-    mut_aa, label, protein_id)
+  data/processed/phase5_esm2_scored.csv (gene, wt_aa, position, mut_aa,
+    label, protein_id, aligned, wt_seq, truncated, esm2_score -- Person A's
+    output). 758 rows: Person A already dropped 25 benign rows whose wt_aa
+    didn't align to their own reference sequence -- 22 of those are exactly
+    the wt_aa-vs-AlphaFold-structure mismatches this script independently
+    flagged in the prior 783-row input (see phase5_wt_aa_mismatches.csv from
+    that run), which cross-validates both checks. This script still re-runs
+    its own structure-based wt_aa check below rather than trusting
+    `aligned` blindly, since it's a check against a different reference
+    (AlphaFold's canonical sequence vs whatever Person A aligned against).
 
 Writes:
-  data/processed/phase5_structural_features.csv
+  data/processed/phase5_structural_features.csv  (adds rsa,
+    secondary_structure, contact_density, dist_to_core, plddt,
+    plddt_confidence to every input row; esm2_score/wt_seq/aligned/truncated
+    carried through unchanged for the downstream correction-model step)
   data/processed/phase5_structural_features_report.csv
+  data/processed/phase5_wt_aa_mismatches.csv
   structures/  (downloaded AlphaFold fragments, cached so re-runs are fast)
 
 Usage (from the repo root, with your venv active):
@@ -55,10 +67,11 @@ from structural_features import (
     compute_contact_density,
     compute_dist_to_core,
     get_rsa_and_ss,
-    load_atom_array,
 )
+import biotite.structure as struc
+import biotite.structure.io.pdb as pdb_io
 
-INPUT_CSV = os.path.join("data", "processed", "phase5_clinvar_gnomad_variants.csv")
+INPUT_CSV = os.path.join("data", "processed", "phase5_esm2_scored.csv")
 OUTPUT_CSV = os.path.join("data", "processed", "phase5_structural_features.csv")
 REPORT_CSV = os.path.join("data", "processed", "phase5_structural_features_report.csv")
 MISMATCH_CSV = os.path.join("data", "processed", "phase5_wt_aa_mismatches.csv")
@@ -102,10 +115,22 @@ def fetch_alphafold_fragments(uniprot_id: str, out_dir: str) -> list[str]:
     seen for TP53/PTEN/MSH2/RB1/BRCA1 in the first working run.
     """
     os.makedirs(out_dir, exist_ok=True)
+
+    import glob
+    cached = sorted(glob.glob(os.path.join(out_dir, f"AF-{uniprot_id}-F*.pdb")))
+    # Only trust the cache if it's just the canonical entry, or numbered
+    # continuations (F1, F2, F3...) -- not the doubled "AF-AF-..." files an
+    # earlier, buggy version of this script could have left behind.
+    cached = [p for p in cached if re.match(rf"^AF-{re.escape(uniprot_id)}-F\d+\.pdb$", os.path.basename(p))]
+
     api_url = f"https://alphafold.ebi.ac.uk/api/prediction/{uniprot_id}"
     try:
         r = requests.get(api_url, timeout=30)
     except requests.RequestException as e:
+        if cached:
+            print(f"  [WARN] AlphaFold API unreachable for {uniprot_id} ({e}) -- "
+                  f"using {len(cached)} already-cached fragment file(s) instead")
+            return cached
         print(f"  [WARN] AlphaFold API request failed for {uniprot_id}: {e}")
         return []
     if r.status_code != 200:
@@ -147,17 +172,54 @@ def fetch_alphafold_fragments(uniprot_id: str, out_dir: str) -> list[str]:
     return paths
 
 
-def build_merged_residue_table(fragment_paths: list[str]) -> list[dict]:
+def load_atom_array_with_confidence(structure_path: str, chain_id: str = "A"):
+    """Like structural_features.load_atom_array, but also pulls per-atom
+    b_factor -- for an AlphaFold PDB file this field holds pLDDT (0-100),
+    AlphaFold's own per-residue confidence score, not a real crystallographic
+    B-factor (confirmed live: VHL's known-disordered N-terminal tail reads
+    43-62 here, consistent with AlphaFold's own reported low-confidence
+    region for that segment). biotite doesn't load b_factor by default, so
+    this passes extra_fields explicitly rather than reusing the shared
+    Phase 1 loader (which real PDB structures don't need this for)."""
+    pdb_file = pdb_io.PDBFile.read(structure_path)
+    atom_array = pdb_file.get_structure(model=1, extra_fields=["b_factor"])
+    atom_array = atom_array[struc.filter_amino_acids(atom_array)]
+    if chain_id:
+        mask = atom_array.chain_id == chain_id
+        if mask.any():
+            atom_array = atom_array[mask]
+    return atom_array
+
+
+def plddt_confidence_band(plddt: float) -> str:
+    """AlphaFold's own official pLDDT bins."""
+    if np.isnan(plddt):
+        return None
+    if plddt < 50:
+        return "very_low"
+    if plddt < 70:
+        return "low"
+    if plddt < 90:
+        return "confident"
+    return "very_high"
+
+
+def build_merged_residue_table(fragment_paths: list[str]) -> tuple[list[dict], dict[int, float]]:
     """Load every fragment, build its residue table, and merge into one
     table keyed by UniProt residue number (fragments overlap; first
     occurrence wins, which is fine since overlap regions are near-identical
-    predictions of the same sequence)."""
+    predictions of the same sequence). Also returns a {res_id: plddt} lookup
+    built from the CA atom's b_factor in each fragment, same merge rule."""
     merged: dict[int, dict] = {}
+    plddt_lookup: dict[int, float] = {}
     for path in fragment_paths:
-        atom_array = load_atom_array(path, chain_id="A")
+        atom_array = load_atom_array_with_confidence(path, chain_id="A")
         for row in build_residue_table(atom_array):
             merged.setdefault(row["res_id"], row)
-    return [merged[k] for k in sorted(merged)]
+        ca_mask = atom_array.atom_name == "CA"
+        for res_id, b_factor in zip(atom_array.res_id[ca_mask], atom_array.b_factor[ca_mask]):
+            plddt_lookup.setdefault(int(res_id), float(b_factor))
+    return [merged[k] for k in sorted(merged)], plddt_lookup
 
 
 def main():
@@ -179,6 +241,7 @@ def main():
         )
 
     residue_tables: dict[str, list[dict]] = {}
+    plddt_tables: dict[str, dict[int, float]] = {}
     for gene, uniprot_id in GENE_TO_UNIPROT.items():
         if gene not in set(variants["gene"]):
             continue
@@ -187,10 +250,11 @@ def main():
         if not fragment_paths:
             print(f"[WARN] {gene}: no AlphaFold structure found for {uniprot_id}")
             residue_tables[gene] = []
+            plddt_tables[gene] = {}
             continue
         print(f"  {len(fragment_paths)} fragment(s): "
               f"{[os.path.basename(p) for p in fragment_paths]}")
-        residue_tables[gene] = build_merged_residue_table(fragment_paths)
+        residue_tables[gene], plddt_tables[gene] = build_merged_residue_table(fragment_paths)
         max_res = max((r["res_id"] for r in residue_tables[gene]), default=0)
         print(f"  merged residue table covers positions 1-{max_res}")
 
@@ -201,10 +265,13 @@ def main():
         position = int(v["position"])
         wt_aa, mut_aa, label = v["wt_aa"], v["mut_aa"], v["label"]
         table = residue_tables.get(gene, [])
+        plddt_lookup = plddt_tables.get(gene, {})
 
         rsa, ss = get_rsa_and_ss(table, position)
         contact_density = compute_contact_density(table, position)
         dist_to_core = compute_dist_to_core(table, position)
+        plddt = plddt_lookup.get(position, np.nan)
+        confidence = plddt_confidence_band(plddt)
 
         # QC: does the structure's residue at this position actually match
         # the CSV's wt_aa? (Catches wrong isoform / wrong UniProt ID -- and,
@@ -226,13 +293,20 @@ def main():
 
         if wt_match is False:
             rsa, ss, contact_density, dist_to_core = np.nan, None, np.nan, np.nan
+            plddt, confidence = np.nan, None
 
         rows.append({
             "protein_id": v["protein_id"], "gene": gene, "position": position,
             "wt_aa": wt_aa, "mut_aa": mut_aa, "label": label,
             "rsa": rsa, "secondary_structure": ss,
             "contact_density": contact_density, "dist_to_core": dist_to_core,
+            "plddt": plddt, "plddt_confidence": confidence,
             "wt_aa_matches_structure": wt_match,
+            # carried through from Person A's ESM-2 scoring step
+            "esm2_score": v.get("esm2_score", np.nan),
+            "wt_seq": v.get("wt_seq"),
+            "aligned": v.get("aligned"),
+            "truncated": v.get("truncated"),
         })
 
     feat_df = pd.DataFrame(rows)
@@ -242,6 +316,24 @@ def main():
 
     coverage = feat_df["rsa"].notna().mean() * 100
     print(f"Structural feature coverage (non-NaN rsa): {coverage:.1f}%")
+
+    conf_counts = feat_df["plddt_confidence"].value_counts(dropna=False)
+    print(f"\npLDDT confidence bands (AlphaFold's own bins): {conf_counts.to_dict()}")
+    low_conf_n = int(feat_df["plddt_confidence"].isin(["low", "very_low"]).sum())
+    if low_conf_n:
+        print(f"[NOTE] {low_conf_n} variants fall in AlphaFold's low/very_low pLDDT bands "
+              f"(<70) -- features are still reported (not nulled), but treat RSA/burial at "
+              f"these positions cautiously: low pLDDT usually means a disordered or "
+              f"poorly-predicted region, where 'buried vs exposed' is less meaningful. "
+              f"See the plddt_confidence column to filter or weight these downstream.")
+
+    if "truncated" in feat_df.columns:
+        n_truncated = int(feat_df["truncated"].fillna(False).sum())
+        if n_truncated:
+            print(f"[NOTE] {n_truncated} variants used a truncated ESM-2 input sequence "
+                  f"(Person A's `truncated` flag, carried through unchanged) -- their "
+                  f"esm2_score may reflect incomplete sequence context, independent of "
+                  f"the structural features computed here.")
 
     mismatch_df = pd.DataFrame(mismatch_rows)
     only_mismatches = mismatch_df[mismatch_df["match"] == False].sort_values(["gene", "position"])
